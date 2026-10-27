@@ -1,0 +1,36 @@
+name: Bug report
+description: FocusGuard blocked something it shouldn't, let something through, or misbehaved.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: FocusGuard version
+      description: Output of `focusguard --version`, or shown at the bottom of the settings app's Status page.
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Operating system
+      description: For example "Windows 11 23H2" or "Ubuntu 24.04, GNOME on X11" or "Arch, i3".
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Run `focusguard --dry-run --verbose`, reproduce the problem, and paste the lines from that moment. Remove anything private from window titles.
+      render: text
+  - type: textarea
+    id: config
+    attributes:
+      label: Settings
+      description: Output of `focusguard --print-config`, if it might matter.
+      render: text

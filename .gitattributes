@@ -1,0 +1,11 @@
+# Normalise line endings in the repository; check out text with native endings.
+* text=auto
+
+# Keep these LF everywhere (CI and tools read them on Linux too).
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.conf* text eol=lf
+
+# Binary assets
+*.png  binary
+*.ico  binary

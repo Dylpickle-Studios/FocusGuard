@@ -1,0 +1,185 @@
+name: Build and release
+
+# Every push and pull request builds both apps and keeps the packages as
+# workflow artifacts. Pushing a tag like v1.0.0 (matching the version in
+# CMakeLists.txt) also publishes them as a GitHub release; a tag with a
+# suffix such as v1.0.0-rc.1 becomes a pre-release.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Read version (and check it against the tag)
+        run: |
+          v=$(sed -nE 's/^project\(focusguard VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt)
+          if [ -z "$v" ]; then
+            echo "::error file=CMakeLists.txt::could not find 'project(focusguard VERSION x.y.z'"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "${tag%%-*}" != "$v" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match version $v in CMakeLists.txt"
+              exit 1
+            fi
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: version
+    # Oldest available glibc, so the binary also runs on older distributions.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libx11-dev libxi-dev libdbus-1-dev \
+                                                          qt6-base-dev libgl1-mesa-dev
+      - name: Build the daemon
+        # libstdc++ linked in, so the daemon runs on distributions with an older one.
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DFOCUSGUARD_GUI=OFF \
+                -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+          cmake --build build --parallel
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Build the settings app
+        # Uses the system's Qt (and so its libstdc++); built against Qt 6.2, it runs with any newer Qt 6.
+        run: |
+          cmake -B build-gui -DCMAKE_BUILD_TYPE=Release -DFOCUSGUARD_GUI=ON -DFOCUSGUARD_TESTS=OFF
+          cmake --build build-gui --parallel --target focusguard-settings
+      - name: Smoke test
+        run: |
+          ./build/focusguard --version
+          ./build/focusguard --config focusguard.conf.example --print-config
+          # The app must start and keep running (timeout ends it: exit status 124).
+          status=0
+          QT_QPA_PLATFORM=offscreen timeout 5 ./build-gui/focusguard-settings || status=$?
+          [ "$status" -eq 124 ] || { echo "::error::focusguard-settings exited early ($status)"; exit 1; }
+      - name: Package
+        run: |
+          dir=focusguard-${{ needs.version.outputs.version }}-linux-x86_64
+          mkdir "$dir"
+          cp build/focusguard build-gui/focusguard-settings README.md LICENSE THIRD-PARTY-NOTICES.md \
+             CHANGELOG.md focusguard.conf.example data/focusguard-settings.desktop data/focusguard.svg "$dir/"
+          strip "$dir/focusguard" "$dir/focusguard-settings"
+          tar czf "$dir.tar.gz" "$dir"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: focusguard-*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          arch: win64_msvc2022_64
+          cache: true
+      - name: Build console version and the settings app
+        run: |
+          cmake -B build -A x64 -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
+          cmake --build build --config Release
+      - name: Build tray-only version (no console window)
+        run: |
+          cmake -B build-tray -A x64 -DFOCUSGUARD_NO_CONSOLE=ON -DFOCUSGUARD_GUI=OFF -DFOCUSGUARD_TESTS=OFF
+          cmake --build build-tray --config Release
+      - name: Unit tests
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Smoke test
+        run: |
+          ./build/Release/focusguard.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./build/Release/focusguard.exe --config focusguard.conf.example --print-config
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package
+        run: |
+          $dir = "focusguard-${{ needs.version.outputs.version }}-windows-x64"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item build/Release/focusguard.exe "$dir/"
+          Copy-Item build-tray/Release/focusguard.exe "$dir/focusguard-tray.exe"
+          Copy-Item build/Release/focusguard-settings.exe "$dir/"
+          Copy-Item README.md, LICENSE, THIRD-PARTY-NOTICES.md, CHANGELOG.md, focusguard.conf.example "$dir/"
+          # Qt's DLLs and plugins for the settings app (the daemons need none of them).
+          windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw --no-compiler-runtime `
+                      "$dir/focusguard-settings.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The MSVC runtime Qt needs, so the zip also runs where it isn't installed.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -Directory | Sort-Object FullName | Select-Object -Last 1
+          if (-not $crt) { Write-Error "MSVC runtime DLLs not found"; exit 1 }
+          Copy-Item "$($crt.FullName)\*.dll" "$dir/"
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: focusguard-*.zip
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release notes from the changelog
+        run: |
+          # The section for this version: from its "## [x.y.z]" heading up to the
+          # next heading or the link definitions at the end of the file.
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="${version%%-*}" '
+            /^## \[/ { if (found) exit; if (index($0, "## [" v "]") == 1) { found = 1; next } }
+            /^\[[^]]+\]: / { if (found) exit }
+            found' CHANGELOG.md > notes.md
+          echo "--- notes:"; cat notes.md
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # Re-run of the workflow: refresh the files on the existing release.
+            gh release upload "$tag" dist/* --clobber
+          else
+            flags=()
+            [[ "$tag" == *-* ]] && flags+=(--prerelease)
+            if [ -s notes.md ]; then flags+=(--notes-file notes.md); else flags+=(--generate-notes); fi
+            gh release create "$tag" dist/* --title "FocusGuard $tag" "${flags[@]}"
+          fi

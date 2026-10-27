@@ -1,0 +1,20 @@
+# Build output
+/build*/
+/out/
+CMakeUserPresets.json
+compile_commands.json
+
+# Release packaging (CI)
+/focusguard-*/
+/focusguard-*.zip
+/focusguard-*.tar.gz
+/dist/
+
+# Editors and OS files
+.vscode/
+.idea/
+.vs/
+*.user
+*.swp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,79 @@
+# FocusGuard configuration.
+#   Linux:   ~/.config/focusguard.conf   (or $XDG_CONFIG_HOME/focusguard.conf)
+#   Windows: %APPDATA%\FocusGuard\focusguard.conf
+# Command-line options override anything set here.
+# Edit and then reload live: tray menu "Reload settings", or 'pkill -HUP focusguard' on Linux.
+
+# --- Timing -----------------------------------------------------------------
+
+# A focus change within this many ms of a deliberate action
+# (mouse click, Enter, Esc, Alt/Win shortcuts) is allowed.
+grace = 1500
+
+# Apps you just launched may take focus for this long while they start up.
+# 0 disables the rule.
+launch-grace = 15000
+
+# Stop reverting a window that grabs focus back more than this many times
+# within 3 seconds (0 = fight forever).
+fight-limit = 10
+
+# --- Lists ------------------------------------------------------------------
+# NAME is a process name (".exe" optional) or, on Linux, the window's WM_CLASS.
+# Use * and ? for globs; a glob is matched against the process, class and title.
+# Prefix with "title:" to match the window title instead.
+# One per line or comma-separated; both keys may repeat.
+
+# Always LET these take focus:
+# allow = keepassxc
+# allow = obs64, zoom
+
+# Never let these take focus on their own (the exemption list), not even right
+# after you launch them. Clicking them or Alt+Tab still works.
+# block = *updater*
+# block = teams, title:*Software Update*
+
+# --- Rules ------------------------------------------------------------------
+
+# strict = yes disables the three lenient rules below in one go, so only your
+# own actions and the allow list can change focus.
+# strict = no
+
+# Auto-allow an app's own windows / dialogs of the current window / apps you
+# just launched. (strict = yes is the same as setting all three to no.)
+allow-same-app = yes
+allow-related  = yes
+allow-launched = yes
+
+# --- On a block -------------------------------------------------------------
+
+# Also minimise the window that tried to steal focus.
+minimize-on-block = no
+
+# Show a desktop notification when a window is blocked.
+# Linux sends them over D-Bus (or 'notify-send'); Windows uses a tray balloon.
+notify = no
+notify-cooldown = 5000
+
+# Log only, block nothing. Handy for tuning the lists.
+dry-run = no
+
+# --- Logging & misc ---------------------------------------------------------
+
+# Mouse movement counts as intent. Enable for focus-follows-mouse setups.
+count-motion = no
+
+# verbose = yes          # also log allowed changes
+# log = /path/to/focusguard.log
+
+# Show a tray icon. On Linux it works with StatusNotifierItem trays (KDE, Xfce,
+# Cinnamon, LXQt, GNOME with the AppIndicator extension, ...) and with XEmbed
+# trays (i3bar, polybar, stalonetray, ...).
+tray = yes
+
+# Keep the activity history and all-time statistics across restarts.
+# Stored in ~/.local/state/focusguard (Linux) or %LOCALAPPDATA%\FocusGuard.
+history = yes
+
+# Windows only: detach from the console window.
+background = no

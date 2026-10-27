@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=FocusGuard Settings
+GenericName=Focus stealing prevention
+Comment=See and change what FocusGuard lets take your keyboard focus
+Exec=focusguard-settings
+Icon=focusguard
+Terminal=false
+Categories=Settings;Utility;
+Keywords=focus;steal;window;popup;
+StartupNotify=true
