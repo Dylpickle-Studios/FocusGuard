@@ -44,8 +44,9 @@
 namespace {
 
 constexpr UINT WM_TRAYICON = WM_APP + 1;
+constexpr UINT_PTR kResumeTimer = 1;
 enum : UINT {
-    ID_PAUSE = 100, ID_DRYRUN, ID_STRICT, ID_NOTIFY, ID_MINIMIZE,
+    ID_PAUSE = 100, ID_PAUSE15, ID_PAUSE60, ID_DRYRUN, ID_STRICT, ID_NOTIFY, ID_MINIMIZE,
     ID_STATS, ID_RELOAD, ID_OPENCFG, ID_EXIT
 };
 
@@ -64,7 +65,9 @@ HWND g_expected = nullptr;  // window we are restoring; its activation is our ow
 bool g_in_focus_change = false;                     // reentrancy guard, see win_event_proc
 std::vector<std::pair<HWND, DWORD>> g_deferred;     // foreground events that arrived meanwhile
 bool g_paused = false;
+long long g_resume_at = 0;     // a timed pause ends then (ms since the epoch); 0: none
 bool g_tray_added = false;
+HWND g_notified = nullptr;     // the blocked window the current balloon is about
 NOTIFYICONDATAW g_nid{};
 UINT g_msg_taskbar_created = 0;
 fg::ControlServer g_ctl;  // the settings app's connection
@@ -248,14 +251,16 @@ void sync_history();
 
 // ------------------------------------------------------------------ notify
 
-// Show a tray balloon. Falls back silently if there is no tray icon.
-void notify(const std::string& app, const std::string& title) {
+// Show a tray balloon; clicking it shows the blocked window. Falls back
+// silently if there is no tray icon.
+void notify(const std::string& app, const std::string& title, HWND blocked) {
     if (!g_tray_added) return;
+    g_notified = blocked;
     g_nid.uFlags = NIF_INFO;
     g_nid.dwInfoFlags = NIIF_WARNING;
     lstrcpynW(g_nid.szInfoTitle, L"FocusGuard blocked a window", ARRAYSIZE(g_nid.szInfoTitle));
     const std::string body = app + (title.empty() ? "" : ": " + fg::ellipsize(title, 80)) +
-                             " tried to steal focus";
+                             " tried to steal focus. Click to show it.";
     lstrcpynW(g_nid.szInfo, widen(body).c_str(), ARRAYSIZE(g_nid.szInfo));
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
     g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;  // restore for later NIM_MODIFYs
@@ -290,7 +295,7 @@ void reload() {
 
 std::string status_json() {
     const std::string path = g_cfg.config_path.empty() ? default_config_path() : g_cfg.config_path;
-    return fg::status_json({g_cfg, g_paused, g_stats, g_all_time, g_since, (long long)GetCurrentProcessId(), path,
+    return fg::status_json({g_cfg, g_paused, g_resume_at, g_stats, g_all_time, g_since, (long long)GetCurrentProcessId(), path,
                             fg::has_cli_overrides(g_args), g_overrides.list()});
 }
 
@@ -334,8 +339,8 @@ void push_status() {
 }
 
 void record_event(const char* kind, const std::string& app, const std::string& process, const std::string& cls,
-                  const std::string& title, const char* reason) {
-    fg::Event e{fg::wall_ms(), kind, app, process, cls, title, reason};
+                  const std::string& title, const char* reason, long long after_ms) {
+    fg::Event e{fg::wall_ms(), kind, app, process, cls, title, reason, after_ms};
     if (g_ctl.has_subscribers()) g_ctl.broadcast(fg::event_json(e, "event"));
     g_history.append(e);
     g_events.add(std::move(e));
@@ -413,10 +418,14 @@ void on_focus_change(HWND h, DWORD event_time) {
     f.blocklisted = g_block.match(proc.name, "", cls, title);
 
     const std::string who = describe(app, title);
-    auto record = [&](const char* kind, const char* reason) { record_event(kind, app, proc.name, cls, title, reason); };
+    const long long after = g_intent.since_last(t);
+    auto record = [&](const char* kind, const char* reason) {
+        record_event(kind, app, proc.name, cls, title, reason, after);
+    };
 
     const fg::Decision d = fg::decide(f);
     if (d.allow) {
+        if (f.user_intent) g_intent.switched(t);  // apps launched before this lose their launch pass
         if (fg::log_state().level >= 2) fg::logmsg(2, "allowed  %s  (%s)", who.c_str(), d.reason);
         record("allowed", d.reason);
         return;
@@ -447,7 +456,7 @@ void on_focus_change(HWND h, DWORD event_time) {
         fg::logmsg(1, "blocked  %s  (%s)", who.c_str(), d.reason);
         record("blocked", d.reason);
         push_status();  // the statistics changed
-        if (g_cfg.notify && g_notify_gate.allow(now, g_cfg)) notify(app, title);
+        if (g_cfg.notify && g_notify_gate.allow(now, g_cfg)) notify(app, title, h);
     } else {
         g_expected = nullptr;
         fg::logmsg(1, "FAILED   %s  (Windows refused to restore focus; try running as administrator)",
@@ -551,23 +560,49 @@ void tray_update() {
     g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = g_paused ? tray_icon(2, IDI_WARNING) : g_cfg.dry_run ? tray_icon(3, IDI_SHIELD) : tray_icon(1, IDI_SHIELD);
-    const wchar_t* tip = g_paused ? L"FocusGuard - paused (click to resume)"
-                         : g_cfg.dry_run ? L"FocusGuard - dry run (logging only)"
-                                         : L"FocusGuard - protecting focus";
-    lstrcpynW(g_nid.szTip, tip, ARRAYSIZE(g_nid.szTip));
+    const std::wstring tip = g_paused && g_resume_at
+                                 ? L"FocusGuard - paused until " + widen(fg::local_hhmm(g_resume_at)) + L" (click to resume)"
+                             : g_paused     ? L"FocusGuard - paused (click to resume)"
+                             : g_cfg.dry_run ? L"FocusGuard - dry run (logging only)"
+                                             : L"FocusGuard - protecting focus";
+    lstrcpynW(g_nid.szTip, tip.c_str(), ARRAYSIZE(g_nid.szTip));
     g_tray_added = Shell_NotifyIconW(g_tray_added ? NIM_MODIFY : NIM_ADD, &g_nid) != FALSE;
 }
 
-void set_paused(bool paused) {
-    g_paused = paused;
-    if (!paused) {  // resync, but never adopt our own hidden window
-        HWND fgw = GetForegroundWindow();
-        if (fgw && window_pid(fgw) != GetCurrentProcessId()) g_current = fgw;
-        g_expected = nullptr;
+// Wake up when a timed pause ends, or within a minute to recheck the wall
+// clock (time spent asleep doesn't advance timers reliably).
+void arm_resume_timer() {
+    const long long left = g_resume_at - fg::wall_ms();
+    SetTimer(g_wnd, kResumeTimer, (UINT)std::clamp(left, 1LL, 60000LL), nullptr);
+}
+
+// Pause for `minutes`, or (0) until resumed; or resume.
+void set_paused(bool paused, uint32_t minutes = 0) {
+    g_resume_at = paused && minutes ? fg::wall_ms() + minutes * 60000LL : 0;
+    if (g_resume_at) arm_resume_timer();
+    else KillTimer(g_wnd, kResumeTimer);
+    if (paused != g_paused) {
+        g_paused = paused;
+        if (!paused) {  // resync, but never adopt our own hidden window
+            HWND fgw = GetForegroundWindow();
+            if (fgw && window_pid(fgw) != GetCurrentProcessId()) g_current = fgw;
+            g_expected = nullptr;
+        }
     }
-    fg::logmsg(1, "%s", paused ? "paused" : "resumed");
+    if (!paused) fg::logmsg(1, "resumed");
+    else if (minutes) fg::logmsg(1, "paused until %s", fg::local_hhmm(g_resume_at).c_str());
+    else fg::logmsg(1, "paused");
     tray_update();
     push_status();
+}
+
+// Bring a blocked window to the front because the user asked (balloon click).
+void show_window(HWND h) {
+    if (!h || !IsWindow(h)) return;
+    if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+    g_expected = h;  // our own doing: don't judge it
+    if (restore_foreground(h)) g_current = h;
+    else g_expected = nullptr;
 }
 
 void open_config() {
@@ -615,7 +650,13 @@ void tray_menu() {
     const bool strict = !(g_cfg.allow_same_app && g_cfg.allow_launched && g_cfg.allow_related);
     HMENU m = CreatePopupMenu();
     if (!m) return;
-    AppendMenuW(m, MF_STRING | (g_paused ? MF_CHECKED : 0), ID_PAUSE, L"Paused");
+    const std::wstring paused_label =
+        g_paused && g_resume_at ? L"Paused until " + widen(fg::local_hhmm(g_resume_at)) : L"Paused";
+    AppendMenuW(m, MF_STRING | (g_paused ? MF_CHECKED : 0), ID_PAUSE, paused_label.c_str());
+    if (!g_paused) {
+        AppendMenuW(m, MF_STRING, ID_PAUSE15, L"Pause for 15 minutes");
+        AppendMenuW(m, MF_STRING, ID_PAUSE60, L"Pause for 1 hour");
+    }
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (strict ? MF_CHECKED : 0), ID_STRICT, L"Strict mode");
     AppendMenuW(m, MF_STRING | (g_cfg.minimize_on_block ? MF_CHECKED : 0), ID_MINIMIZE, L"Minimise blocked windows");
@@ -637,6 +678,8 @@ void tray_menu() {
 
     switch (cmd) {
         case ID_PAUSE: set_paused(!g_paused); break;
+        case ID_PAUSE15: set_paused(true, 15); break;
+        case ID_PAUSE60: set_paused(true, 60); break;
         case ID_STRICT: flip(fg::Toggle::Strict, "strict mode"); break;
         case ID_MINIMIZE: flip(fg::Toggle::Minimize, "minimise-on-block"); break;
         case ID_NOTIFY: flip(fg::Toggle::Notify, "notifications"); break;
@@ -646,6 +689,7 @@ void tray_menu() {
             break;
         case ID_STATS: {
             g_stats.dump("");
+            g_notified = nullptr;  // this balloon isn't about a window
             g_nid.uFlags = NIF_INFO;
             g_nid.dwInfoFlags = NIIF_INFO;
             lstrcpynW(g_nid.szInfoTitle, L"FocusGuard statistics", ARRAYSIZE(g_nid.szInfoTitle));
@@ -672,6 +716,18 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TRAYICON:
             if (LOWORD(lp) == WM_LBUTTONUP) set_paused(!g_paused);
             else if (LOWORD(lp) == WM_RBUTTONUP) tray_menu();
+            else if (LOWORD(lp) == NIN_BALLOONUSERCLICK) show_window(std::exchange(g_notified, nullptr));
+            return 0;
+        case WM_TIMER:
+            if (wp != kResumeTimer) break;
+            if (!g_paused || !g_resume_at) {
+                KillTimer(h, kResumeTimer);
+            } else if (fg::wall_ms() >= g_resume_at) {
+                fg::logmsg(1, "pause over");
+                set_paused(false);
+            } else {
+                arm_resume_timer();
+            }
             return 0;
         case WM_CLOSE:
             DestroyWindow(h);
@@ -794,9 +850,7 @@ int main() {
     const fg::ControlHooks control_hooks{
         status_json,
         [] { return fg::windows_json(list_windows()); },
-        [](bool pause) {
-            if (pause != g_paused) set_paused(pause);
-        },
+        [](bool pause, uint32_t minutes) { set_paused(pause, minutes); },
         reload,
         [] { PostMessageW(g_wnd, WM_CLOSE, 0, 0); },
         clear_history,

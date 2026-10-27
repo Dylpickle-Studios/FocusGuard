@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 cmake_minimum_required(VERSION 3.16)
-project(focusguard VERSION 1.0.0 LANGUAGES CXX)
+project(focusguard VERSION 1.0.1 LANGUAGES CXX)
+include(GNUInstallDirs)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -60,7 +61,10 @@ else()
     target_compile_definitions(focusguard PRIVATE FOCUSGUARD_TRAY)
   endif()
   target_compile_options(focusguard PRIVATE -Wall -Wextra)
-  install(TARGETS focusguard RUNTIME DESTINATION bin)
+  install(TARGETS focusguard RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(FILES README.md CHANGELOG.md THIRD-PARTY-NOTICES.md focusguard.conf.example
+          DESTINATION ${CMAKE_INSTALL_DOCDIR})
+  install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} RENAME copyright)  # Debian's name for it
 endif()
 
 # ---------------------------------------------------------------- tests
@@ -95,6 +99,7 @@ if(FOCUSGUARD_GUI)
       gui/main.cpp gui/main_window.cpp gui/main_window.h gui/pages.cpp gui/pages.h
       gui/widgets.cpp gui/widgets.h gui/daemon_client.cpp gui/daemon_client.h
       gui/platform.cpp gui/platform.h gui/settings_model.cpp gui/settings_model.h
+      gui/update_check.cpp gui/update_check.h
       src/common.hpp src/control.hpp)
     set_target_properties(focusguard-settings PROPERTIES AUTOMOC ON)
     target_include_directories(focusguard-settings PRIVATE src)
@@ -107,9 +112,33 @@ if(FOCUSGUARD_GUI)
       target_compile_options(focusguard-settings PRIVATE -Wall -Wextra)
     endif()
     if(NOT WIN32)
-      install(TARGETS focusguard-settings RUNTIME DESTINATION bin)
-      install(FILES data/focusguard-settings.desktop DESTINATION share/applications)
-      install(FILES data/focusguard.svg DESTINATION share/icons/hicolor/scalable/apps)
+      install(TARGETS focusguard-settings RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+      install(FILES data/focusguard-settings.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+      install(FILES data/focusguard.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
     endif()
   endif()
+endif()
+
+# ---------------------------------------------------------------- packages
+
+# Linux: `cpack -G DEB` in a build directory makes a .deb from the install rules
+# above, with dependencies worked out from the binaries by dpkg-shlibdeps.
+# (The Windows installer is made by installer/focusguard.iss instead.)
+if(NOT WIN32)
+  set(CPACK_PACKAGE_NAME focusguard)
+  set(CPACK_PACKAGE_VENDOR "FocusGuard")
+  set(CPACK_PACKAGE_CONTACT "DylanBeMe <https://github.com/DylanBeMe/FocusGuard/issues>")
+  set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/DylanBeMe/FocusGuard")
+  set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "stops windows from stealing your keyboard focus")
+  set(CPACK_PACKAGE_DESCRIPTION "When a window takes the keyboard focus without you asking for it, FocusGuard
+hands focus straight back to the window you were using and marks the newcomer
+as wanting attention, so you can switch to it when you want. Includes a tray
+icon and FocusGuard Settings, a small app to watch and configure it.")
+  set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+  set(CPACK_DEBIAN_PACKAGE_SECTION utils)
+  set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+  set(CPACK_STRIP_FILES ON)
+  set(CPACK_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS
+      OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+  include(CPack)
 endif()

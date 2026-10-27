@@ -40,11 +40,12 @@ It is a tiny native background program: it sleeps until the system reports a foc
 ## Features
 
 - **Gives focus back** to your window the instant something else takes it, and flashes the intruder's taskbar entry instead.
-- **Knows what you meant to do:** clicks, Alt+Tab, Win/Super shortcuts, Enter and Esc count as your intent; plain typing deliberately doesn't. Apps you just launched may still come to the front while they start.
+- **Knows what you meant to do:** clicks, Alt+Tab, Win/Super shortcuts, Enter and Esc count as your intent; plain typing deliberately doesn't. Apps you just launched may still come to the front while they start, until you switch to another window.
 - **Allow and block lists** by process name, Linux window class, wildcard pattern or window title.
-- **Strict mode** and per-rule switches, **dry run** for tuning, **minimise** persistent offenders, rate-limited **notifications**.
+- **Strict mode** and per-rule switches, **dry run** for tuning, **minimise** persistent offenders, rate-limited **notifications** (on Linux with *Show it* and *Always allow* buttons).
+- **Pause for a while**: 15 minutes, an hour, or until you resume.
 - **Tray icon** on both platforms that shows the state at a glance (protecting, paused, dry run).
-- **Settings app** with live activity, statistics, every option explained, list editing and a window picker.
+- **Settings app** with live activity (including how long after your last action each window arrived, to help tune the grace period), statistics, every option explained, list editing and a window picker.
 - **History** of blocked windows and all-time statistics that survive restarts (can be turned off).
 - **Live reload**: change the settings and they apply immediately.
 - **Light on resources**, event-driven, no input hooks, no admin rights needed.
@@ -53,12 +54,25 @@ It is a tiny native background program: it sleeps until the system reports a foc
 
 ### Windows
 
-1. Download `focusguard-<version>-windows-x64.zip` from the [latest release](https://github.com/DylanBeMe/FocusGuard/releases/latest) and unzip it anywhere, keeping the files together.
-2. Run **`focusguard-settings.exe`** and click **Start FocusGuard**. Turn on **Start FocusGuard when you log in** if you want it running all the time.
+Download `focusguard-<version>-windows-x64-setup.exe` from the [latest release](https://github.com/DylanBeMe/FocusGuard/releases/latest) and run it. It installs for your user account only, with no administrator prompt, adds **FocusGuard** to the Start menu, and starts FocusGuard right away and whenever you log in (you can untick that). Running a newer installer later upgrades in place and keeps your settings. Uninstall it from Windows' *Installed apps*.
 
-The zip contains `focusguard-tray.exe` (FocusGuard without a console window, which the settings app starts), `focusguard.exe` (the same with a console that shows its log) and `focusguard-settings.exe` with the Qt files it needs. FocusGuard runs on Windows 7 and later; the settings app needs Windows 10 or later. To also protect windows of programs running as administrator, FocusGuard itself has to run as administrator.
+**Portable:** download `focusguard-<version>-windows-x64.zip` instead and unzip it anywhere, keeping the files together. Run **`focusguard-settings.exe`**, click **Start FocusGuard**, and turn on **Start FocusGuard when you log in** if you want it running all the time.
+
+Both contain `focusguard-tray.exe` (FocusGuard without a console window, which the installer and the settings app start), `focusguard.exe` (the same with a console that shows its log) and `focusguard-settings.exe` with the Qt files it needs. The installer and the settings app need Windows 10 or later; FocusGuard itself also runs on Windows 7 and 8 from the zip. To also protect windows of programs running as administrator, FocusGuard itself has to run as administrator.
+
+Windows may show a SmartScreen warning the first time, because the programs aren't code-signed yet; choose *More info* → *Run anyway*.
 
 ### Linux (X11)
+
+**Debian, Ubuntu, Mint and other Debian-based distributions** (Ubuntu 22.04 / Debian 12 or newer): download `focusguard_<version>_amd64.deb` from the [latest release](https://github.com/DylanBeMe/FocusGuard/releases/latest) and install it, which also pulls in the Qt libraries the settings app needs:
+
+```sh
+sudo apt install ./focusguard_*_amd64.deb
+```
+
+Then open **FocusGuard Settings** from your applications menu, click **Start FocusGuard**, and turn on **Start FocusGuard when you log in**.
+
+**Other distributions:**
 
 1. Download `focusguard-<version>-linux-x86_64.tar.gz` from the [latest release](https://github.com/DylanBeMe/FocusGuard/releases/latest) and unpack it.
 2. The settings app uses your system's Qt 6.2 or newer:
@@ -78,13 +92,13 @@ Every focus change is allowed if any of these is true; otherwise it's reverted:
 2. **The previous window is gone**: closed, minimised, or on another workspace or virtual desktop.
 3. **It's on your allow list.**
 4. **It's the same application** (an app opening its own window), or **a dialog** of the window you were in.
-5. **You just launched it**: its process started right after one of your deliberate actions and is less than 15 s old, so "Start menu → type → Enter → the app appears 5 s later" works.
+5. **You just launched it**: its process started right after one of your deliberate actions and is less than 15 s old, so "Start menu → type → Enter → the app appears 5 s later" works. If you switch to another window while it's starting, that pass ends: you've moved on, and it waits in the taskbar instead.
 
 The **block list** takes away rules 3 to 5 for matching windows: they only get focus when you switch to them yourself. Rules 4 and 5 can be switched off one by one, or all at once with **strict mode**. Simulated input (SendInput, xdotool, macro tools) never counts as you. If an app fights back more than 10 times in 3 s, FocusGuard lets it win rather than flicker forever.
 
 ## The tray icon
 
-The shield in the tray shows the state: **blue** when protecting, **grey** when paused, **amber** in dry run. Left-click pauses and resumes. The menu has pause, strict mode, minimise blocked windows, notifications, dry run, statistics, **Settings…** (opens the settings app, or the settings file if the app isn't installed), reload and quit.
+The shield in the tray shows the state: **blue** when protecting, **grey** when paused, **amber** in dry run. Left-click pauses and resumes. The menu has pause (also for 15 minutes or 1 hour, after which FocusGuard resumes by itself), strict mode, minimise blocked windows, notifications, dry run, statistics, **Settings…** (opens the settings app, or the settings file if the app isn't installed), reload and quit.
 
 Toggles you make in the tray menu stay in effect when the settings are reloaded, until the settings file itself changes that setting. The settings app points them out and can save them to the file.
 
@@ -95,14 +109,16 @@ On Linux, FocusGuard uses whichever tray your desktop has:
 
 If there's no tray, FocusGuard says so once and adds the icon as soon as one appears. `tray = no` turns the icon off.
 
+With `notify = yes`, each blocked window gets a desktop notification. On Linux it has two buttons: **Show it** brings the window to the front, and **Always allow** adds its app to the allow list in your settings file. On Windows, clicking the notification shows the window.
+
 ## The settings app
 
 `focusguard-settings` (Qt 6, Windows and Linux) has four pages:
 
 | | |
 | --- | --- |
-| **Status** | Whether FocusGuard is protecting, paused or in dry run; Pause/Resume and Start/Stop; how many windows were blocked this session and since you started counting, with the top offenders; and a switch to start FocusGuard at login. |
-| **Activity** | Every decision as it happens: time, result (blocked, would block, gave up; optionally allowed too), app, window title and reason. Right-click an entry to always allow or block that app. |
+| **Status** | Whether FocusGuard is protecting, paused or in dry run; Pause (until you resume, for 15 minutes or for an hour), Resume and Start/Stop; how many windows were blocked this session and since you started counting, with the top offenders; switches to start FocusGuard at login and to check for new versions. The first time you open it, it offers to start FocusGuard now and at every login. |
+| **Activity** | Every decision as it happens: time, result (blocked, would block, gave up; optionally allowed too), app, window title, reason, and how long after your last click, Alt+Tab, Enter or similar it came. Times close to your grace period are orange; hover over one to see whether a shorter or longer grace period would have changed the outcome. Right-click an entry to always allow or block that app. |
 | **Settings** | Every option, explained, with switches and fields. |
 | **Lists** | The allow and block lists. **Pick a window…** shows your open windows with their app, process, class and title; choose one and how to recognise it, and the right entry is added. |
 
@@ -160,13 +176,16 @@ Lists are repeatable and comma-separated (`block = *updater*, teams`). If a wind
 | Action | Windows | Linux |
 | --- | --- | --- |
 | Pause / resume | settings app, or left-click the tray icon | settings app, tray, or `pkill -USR1 focusguard` |
+| Pause for a while | settings app, or the tray menu | settings app, or the tray menu |
 | Show statistics | settings app, or the tray menu | settings app, tray, or `pkill -USR2 focusguard` |
 | Reload settings | automatic from the settings app, or the tray menu | automatic from the settings app, tray, or `pkill -HUP focusguard` |
 | Quit | settings app, tray menu, or Ctrl+C | settings app, tray, Ctrl+C, or `pkill focusguard` |
 
 ## History and privacy
 
-FocusGuard keeps a short history of the windows it blocked (time, app, window title and reason, up to the last 300 entries) and a count of blocks per app, so the settings app can show them after a restart. Everyday focus changes that are allowed are kept in memory only. Nothing ever leaves your computer.
+FocusGuard keeps a short history of the windows it blocked (time, app, window title and reason, up to the last 300 entries) and a count of blocks per app, so the settings app can show them after a restart. Everyday focus changes that are allowed are kept in memory only. FocusGuard itself never sends anything anywhere.
+
+The settings app can check for new versions, but only if you turn on **Check for new versions** on its Status page. It then asks GitHub's public API for the latest FocusGuard release at most once a day; GitHub sees your IP address and the app's version, and nothing else is sent.
 
 - **Linux:** `~/.local/state/focusguard/` (or `$XDG_STATE_HOME/focusguard/`)
 - **Windows:** `%LOCALAPPDATA%\FocusGuard\`
@@ -185,6 +204,7 @@ sudo apt install g++ cmake pkg-config libx11-dev libxi-dev libdbus-1-dev qt6-bas
 cmake -B build && cmake --build build
 ctest --test-dir build          # unit tests
 sudo cmake --install build      # both programs, a menu entry and the icon
+(cd build && cpack -G DEB)      # or a .deb package (configure with -DCMAKE_INSTALL_PREFIX=/usr)
 ```
 
 **Windows** (Visual Studio 2022 or MinGW-w64, with Qt for the settings app):
@@ -210,7 +230,7 @@ g++ -O2 -std=c++17 -DFOCUSGUARD_TRAY src/focusguard_x11.cpp $(pkg-config --cflag
 g++ -O2 -std=c++17 -static src/focusguard_win.cpp -luser32 -lshell32 -ldwmapi -ladvapi32 -o focusguard.exe
 ```
 
-The [GitHub Actions workflow](.github/workflows/build.yml) builds and tests everything for both platforms on every push, and publishes a release when a tag `vX.Y.Z` matching the version in `CMakeLists.txt` is pushed.
+The [GitHub Actions workflow](.github/workflows/build.yml) builds and tests everything for both platforms on every push, including installing and removing the `.deb` and the Windows installer. It publishes a release when a tag `vX.Y.Z` matching the version in `CMakeLists.txt` is pushed. To build the Windows installer yourself, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and see the command at the top of [`installer/focusguard.iss`](installer/focusguard.iss).
 
 ## How it works
 
@@ -228,6 +248,7 @@ The [GitHub Actions workflow](.github/workflows/build.yml) builds and tests ever
 | `gui/` | The settings app |
 | `tests/` | Unit tests |
 | `data/`, `tools/` | Icons, desktop entry, and the tool that generates the Windows icons |
+| `installer/` | The Windows installer (Inno Setup); the `.deb` comes from CPack settings in `CMakeLists.txt` |
 
 ## Limitations
 
@@ -239,7 +260,7 @@ The [GitHub Actions workflow](.github/workflows/build.yml) builds and tests ever
 
 ## Contributing
 
-Bug reports, ideas and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). When reporting a window FocusGuard handles wrongly, the output of `focusguard --dry-run --verbose` for that moment helps a lot.
+Bug reports, ideas and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Planned work, including Wayland support, is in [next-additions.md](next-additions.md). When reporting a window FocusGuard handles wrongly, the output of `focusguard --dry-run --verbose` for that moment helps a lot.
 
 ## License
 

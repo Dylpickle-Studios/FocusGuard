@@ -3,10 +3,12 @@
 // start the daemon, and starting it at login.
 #pragma once
 
+#include <QSettings>
 #include <QString>
 
 namespace platform {
 
+QSettings& preferences();     // the app's own choices (not FocusGuard's settings file)
 QString controlEndpoint();    // the daemon's socket / pipe name
 QString defaultConfigPath();  // where the daemon looks when given no -c
 QString daemonProgram();      // the FocusGuard executable to launch, or empty

@@ -10,7 +10,8 @@
 # (mouse click, Enter, Esc, Alt/Win shortcuts) is allowed.
 grace = 1500
 
-# Apps you just launched may take focus for this long while they start up.
+# Apps you just launched may take focus for this long while they start up
+# (unless you switch to another window in the meantime).
 # 0 disables the rule.
 launch-grace = 15000
 

@@ -11,17 +11,20 @@
 
 class DaemonClient;
 class SettingsModel;
+class UpdateCheck;
 class QComboBox;
 class QFrame;
 class QLabel;
 class QLineEdit;
 class QListWidget;
+class QMenu;
 class QPushButton;
 class QSpinBox;
 class QTreeWidget;
 
 namespace ui {
 class BarList;
+class Card;
 class ShieldWidget;
 class Switch;
 }  // namespace ui
@@ -33,14 +36,22 @@ public:
 
 private:
     void refresh();
+    void startDaemon();
+    void finishWelcome();
 
     DaemonClient* client_;
+    UpdateCheck* updates_;
     ui::ShieldWidget* shield_;
-    QLabel *title_, *subtitle_, *blocked_, *allTime_, *allTimeCaption_, *noBlocks_, *details_, *overrides_;
+    QLabel *title_, *subtitle_, *blocked_, *allTime_, *allTimeCaption_, *noBlocks_, *details_, *overrides_,
+        *updateText_;
     QWidget* allTimeBox_;
-    QPushButton *pause_, *startStop_, *reset_;
+    QFrame* updateBanner_;
+    ui::Card* welcome_;
+    QPushButton *pause_, *startStop_, *reset_, *welcomeStart_;
+    QMenu* pauseMenu_;
     ui::BarList* bars_;
-    ui::Switch* autostart_;
+    ui::Switch *autostart_, *checkUpdates_;
+    QString updateUrl_;
 };
 
 class ActivityPage : public QWidget {
@@ -59,6 +70,7 @@ private:
     DaemonClient* client_;
     SettingsModel* model_;
     QVector<QJsonObject> events_;  // oldest first
+    uint32_t grace_ = 0;           // the grace period the hints refer to
     QTreeWidget* tree_;
     QLabel* empty_;
     ui::Switch* showAllowed_;

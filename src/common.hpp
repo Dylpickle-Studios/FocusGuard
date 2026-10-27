@@ -22,9 +22,7 @@
 #include <utility>
 #include <vector>
 
-#ifdef _WIN32
 #include <filesystem>
-#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 #define FG_PRINTF(fmt_idx, arg_idx) __attribute__((format(printf, fmt_idx, arg_idx)))
@@ -36,7 +34,7 @@ namespace fg {
 
 // The build passes the CMake project version; this fallback covers direct compiles.
 #ifndef FOCUSGUARD_VERSION
-#define FOCUSGUARD_VERSION "1.0.0"
+#define FOCUSGUARD_VERSION "1.0.1"
 #endif
 constexpr const char* kVersion = FOCUSGUARD_VERSION;
 
@@ -89,6 +87,38 @@ inline std::string ellipsize(std::string s, size_t max) {
     while (cut > 0 && ((unsigned char)s[cut] & 0xC0) == 0x80) --cut;
     s.resize(cut);
     return s + "...";
+}
+
+// "14:30": the local time of day for a wall-clock moment (ms since the epoch).
+inline std::string local_hhmm(long long epoch_ms) {
+    const std::time_t t = (std::time_t)(epoch_ms / 1000);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[16];
+    std::snprintf(buf, sizeof buf, "%02d:%02d", tm.tm_hour, tm.tm_min);
+    return buf;
+}
+
+// Is version `a` ("1.2.3", optionally with a leading "v") newer than `b`?
+// A suffix such as "-rc.1" is ignored; unparsable parts count as 0.
+inline bool version_newer(const std::string& a, const std::string& b) {
+    auto parts = [](std::string v) {
+        if (!v.empty() && (v[0] == 'v' || v[0] == 'V')) v.erase(0, 1);
+        std::array<unsigned long, 3> n{};
+        const char* p = v.c_str();
+        for (size_t i = 0; i < n.size() && *p; ++i) {
+            char* end = nullptr;
+            n[i] = std::strtoul(p, &end, 10);
+            if (end == p || *end != '.') break;
+            p = end + 1;
+        }
+        return n;
+    };
+    return parts(a) > parts(b);
 }
 
 // Case-insensitive glob with '*' (any run) and '?' (one char). `pat` must
@@ -386,19 +416,60 @@ public:
         return false;
     }
 
+    // Call when your action moved focus to another window. Remembers that
+    // action (the latest one up to `now`), so launched_by_user can tell which
+    // launches you have since moved on from.
+    void switched(uint32_t now) {
+        uint32_t t = 0;
+        if (latest(now, t) && (!have_switch_ || (int32_t)(t - switch_) > 0)) {
+            switch_ = t;
+            have_switch_ = true;
+        }
+    }
+
+    // Did you switch windows with an action later than `t`?
+    bool switched_after(uint32_t t) const { return have_switch_ && (int32_t)(switch_ - t) > 0; }
+
+    // Milliseconds from your latest deliberate action up to `now`, or -1 if
+    // none is remembered. Shown with each decision to help tune the grace period.
+    long long since_last(uint32_t now) const {
+        uint32_t t = 0;
+        return latest(now, t) ? (long long)(uint32_t)(now - t) : -1;
+    }
+
 private:
+    // The most recent deliberate action at or before `now`.
+    bool latest(uint32_t now, uint32_t& out) const {
+        bool found = false;
+        for (size_t i = 0; i < count_; ++i) {
+            const int32_t d = (int32_t)(now - ring_[i]);
+            if (d >= 0 && (!found || d < (int32_t)(now - out))) {
+                out = ring_[i];
+                found = true;
+            }
+        }
+        return found;
+    }
+
     std::array<uint32_t, 128> ring_{};
     size_t head_ = 0;
     size_t count_ = 0;
     uint32_t last_ = 0;
     bool have_last_ = false;
+    uint32_t switch_ = 0;
+    bool have_switch_ = false;
 };
 
+// A process you started a moment ago may bring up its windows by itself, but
+// only until you go elsewhere: once you switch windows after launching it, a
+// late window (Discord's updater handing over to its main window, say) would
+// otherwise pull you back.
 inline bool launched_by_user(const IntentTracker& it, bool have_age, uint32_t age_ms, uint32_t now,
                              const Config& c) {
     if (!have_age || c.launch_grace_ms == 0 || age_ms > c.launch_grace_ms) return false;
     const uint32_t created = now - age_ms;
-    return it.any_between(created - kLaunchLeadMs, created + 250);  // +250: clock granularity
+    const uint32_t latest = created + 250;  // +250: clock granularity
+    return it.any_between(created - kLaunchLeadMs, latest) && !it.switched_after(latest);
 }
 
 // ------------------------------------------------------------------ decision
@@ -1003,6 +1074,53 @@ inline std::string write_config(const std::string& original, const Config& c) {
     std::string text;
     for (const std::string& l : out) text += l + "\n";
     return text;
+}
+
+// Adds `entry` to the allow (or block) list in the settings file at `path`,
+// creating the file if needed and taking it off the other list. The file is
+// rewritten in place (see write_config) and replaced atomically. Returns false
+// with a message in `err` if the file can't be read, parsed or written.
+inline bool add_to_config_file(const std::string& path, bool allow, const std::string& entry, std::string& err) {
+    std::string text;
+    if (FILE* f = open_utf8(path, "rb")) {
+        char buf[4096];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+        std::fclose(f);
+    }
+    Config c;
+    if (load_config_file(path, c, err) == 1) return false;
+    std::vector<std::string>& list = allow ? c.allow : c.block;
+    std::vector<std::string>& other = allow ? c.block : c.allow;
+    auto same = [&](const std::string& x) { return iequals(trim(x), entry); };
+    other.erase(std::remove_if(other.begin(), other.end(), same), other.end());
+    if (std::none_of(list.begin(), list.end(), same)) list.push_back(entry);
+    const std::string out = write_config(text, c);
+    if (out == text) return true;
+
+    namespace fs = std::filesystem;
+    const fs::path file = fs::u8path(path);
+    std::error_code ec;
+    if (file.has_parent_path()) fs::create_directories(file.parent_path(), ec);
+    const std::string tmp = path + ".tmp";
+    FILE* f = open_utf8(tmp, "wb");
+    if (!f) {
+        err = "cannot write " + tmp;
+        return false;
+    }
+    const bool ok = std::fwrite(out.data(), 1, out.size(), f) == out.size();
+    if (std::fclose(f) != 0 || !ok) {
+        err = "cannot write " + tmp;
+        fs::remove(fs::u8path(tmp), ec);
+        return false;
+    }
+    fs::rename(fs::u8path(tmp), file, ec);
+    if (ec) {
+        err = "cannot replace " + path + ": " + ec.message();
+        fs::remove(fs::u8path(tmp), ec);
+        return false;
+    }
+    return true;
 }
 
 // Did the command line set anything besides the config file? Such options

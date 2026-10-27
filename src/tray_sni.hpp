@@ -7,7 +7,8 @@
 //   LXQt, Budgie, waybar and others. Its menu is exported as com.canonical.dbusmenu.
 //   The panel draws both, so FocusGuard needs no GUI toolkit.
 // * The icon images come from icon.hpp, so they don't depend on the icon theme.
-// * Notifications go straight to org.freedesktop.Notifications.
+// * Notifications go straight to org.freedesktop.Notifications, with buttons
+//   when the notification server supports them.
 // * Nothing blocks: the connection's fd joins the main poll() loop, and menu
 //   clicks are queued and run after dispatch, outside libdbus callbacks.
 #pragma once
@@ -17,6 +18,7 @@
 
 #include <cmath>
 #include <functional>
+#include <map>
 
 #include "common.hpp"
 #include "icon.hpp"
@@ -74,6 +76,9 @@ struct Out {
 inline auto v_str(const char* s) {
     return [s](Out& o) { o.variant("s", [&](Out& v) { v.s(s); }); };
 }
+inline auto v_string(std::string s) {
+    return [s = std::move(s)](Out& o) { o.variant("s", [&](Out& v) { v.s(s); }); };
+}
 inline auto v_bool(bool b) {
     return [b](Out& o) { o.variant("b", [&](Out& v) { v.b(b); }); };
 }
@@ -102,7 +107,8 @@ inline std::vector<Pixmap> render_icon(icon::Style st) {
 
 // ------------------------------------------------------------------ menu
 
-enum class Check { Plain, Paused, Strict, Minimize, Notify, DryRun };
+// PauseFor: a plain item shown only while not paused.
+enum class Check { Plain, Paused, PauseFor, Strict, Minimize, Notify, DryRun };
 
 struct MenuItem {
     int32_t id;
@@ -114,6 +120,8 @@ struct MenuItem {
 // The same entries as the Windows tray menu. Id 0 is the (invisible) root.
 inline constexpr MenuItem kMenu[] = {
     {1, "Paused", Check::Paused, TrayAction::TogglePause},
+    {13, "Pause for 15 minutes", Check::PauseFor, TrayAction::Pause15},
+    {14, "Pause for 1 hour", Check::PauseFor, TrayAction::Pause60},
     {2, nullptr, Check::Plain, TrayAction::Quit},
     {3, "Strict mode", Check::Strict, TrayAction::ToggleStrict},
     {4, "Minimise blocked windows", Check::Minimize, TrayAction::ToggleMinimize},
@@ -140,7 +148,8 @@ inline bool checked(Check c, const TrayState& s) {
         case Check::Minimize: return s.minimize;
         case Check::Notify: return s.notify;
         case Check::DryRun: return s.dry_run;
-        case Check::Plain: break;
+        case Check::Plain:
+        case Check::PauseFor: break;
     }
     return false;
 }
@@ -156,10 +165,13 @@ template <class F> void for_each_item_prop(const MenuItem* m, const TrayState& s
         emit("type", v_str("separator"));
         return;
     }
-    emit("label", v_str(m->label));
+    if (m->check == Check::Paused && s.paused && s.resume_at)
+        emit("label", v_string("Paused until " + local_hhmm(s.resume_at)));
+    else
+        emit("label", v_str(m->label));
     emit("enabled", v_bool(true));
-    emit("visible", v_bool(true));
-    if (m->check != Check::Plain) {
+    emit("visible", v_bool(m->check != Check::PauseFor || !s.paused));
+    if (m->check != Check::Plain && m->check != Check::PauseFor) {
         emit("toggle-type", v_str("checkmark"));
         emit("toggle-state", v_int(checked(m->check, s) ? 1 : 0));
     }
@@ -293,6 +305,8 @@ public:
                            "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',"
                            "member='NameOwnerChanged',arg0='org.kde.StatusNotifierWatcher'",
                            nullptr);
+        // Clicks on our notifications' buttons, and their closing.
+        dbus_bus_add_match(conn_, "type='signal',interface='org.freedesktop.Notifications'", nullptr);
         query_notify_caps();
         dbus_connection_flush(conn_);
         return true;
@@ -337,7 +351,8 @@ public:
 
     void set_state(const TrayState& s) {
         if (have_state_ && s == state_) return;
-        const bool icon_changed = !have_state_ || s.paused != state_.paused || s.dry_run != state_.dry_run;
+        const bool icon_changed = !have_state_ || s.paused != state_.paused || s.dry_run != state_.dry_run ||
+                                  s.resume_at != state_.resume_at;  // the tooltip names the time
         state_ = s;
         have_state_ = true;
         ++revision_;
@@ -354,13 +369,22 @@ public:
         send(m);
     }
 
-    // Fire-and-forget desktop notification.
-    void notify(const std::string& summary, const std::string& body, const char* icon) {
+    // A notification button: key (passed back to on_action) and label.
+    struct NotifyButton {
+        std::string key, label;
+    };
+    using NotifyAction = std::function<void(const std::string& key)>;
+
+    // Desktop notification. With buttons (shown if the notification server
+    // supports them), on_action later receives the key of the one clicked,
+    // or "default" when the notification itself was clicked.
+    void notify(const std::string& summary, const std::string& body, const char* icon,
+                const std::vector<NotifyButton>& buttons = {}, NotifyAction on_action = {}) {
         if (!conn_) return;
         if (!caps_known_) query_notify_caps();
+        const bool with_actions = actions_ && on_action;
         DBusMessage* m = dbus_message_new_method_call("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
                                                       "org.freedesktop.Notifications", "Notify");
-        dbus_message_set_no_reply(m, TRUE);
         sni::Out o;
         dbus_message_iter_init_append(m, &o.it);
         o.s("FocusGuard");
@@ -368,7 +392,15 @@ public:
         o.s(icon);
         o.s(summary);
         o.s(markup_ ? escape_markup(body) : body);
-        o.array("s", [](sni::Out&) {});  // no actions
+        o.array("s", [&](sni::Out& a) {
+            if (!with_actions) return;
+            a.s("default");  // clicking the notification itself
+            a.s("Show");
+            for (const NotifyButton& b : buttons) {
+                a.s(b.key);
+                a.s(b.label);
+            }
+        });
         o.array("{sv}", [](sni::Out& a) {
             a.entry([](sni::Out& e) {
                 e.s("urgency");
@@ -376,7 +408,21 @@ public:
             });
         });
         o.i(-1);  // server's default timeout
-        send(m);
+        if (!with_actions) {
+            dbus_message_set_no_reply(m, TRUE);
+            send(m);
+            return;
+        }
+        // The reply carries the notification's id, which ActionInvoked names later.
+        call_async(m, [this, on_action = std::move(on_action)](DBusMessage* r) {
+            dbus_uint32_t id = 0;
+            if (dbus_message_get_type(r) != DBUS_MESSAGE_TYPE_METHOD_RETURN ||
+                !dbus_message_get_args(r, nullptr, DBUS_TYPE_UINT32, &id, DBUS_TYPE_INVALID) || !id)
+                return;
+            if (notifications_.size() >= 16) notifications_.erase(notifications_.begin());  // oldest
+            notifications_[id] = on_action;
+        });
+        dbus_connection_flush(conn_);
     }
 
     // Handle incoming traffic and run queued menu actions. Call it before
@@ -399,7 +445,10 @@ public:
         std::vector<TrayAction> actions;
         actions.swap(pending_);
         for (TrayAction a : actions) handler_(a);
-        return worked || !actions.empty();
+        std::vector<std::function<void()>> calls;
+        calls.swap(pending_calls_);
+        for (auto& c : calls) c();
+        return worked || !actions.empty() || !calls.empty();
     }
 
     void close() {
@@ -471,12 +520,13 @@ private:
                 dbus_message_iter_get_arg_type(&it) != DBUS_TYPE_ARRAY)
                 return;
             caps_known_ = true;
-            markup_ = false;
+            markup_ = actions_ = false;
             for (dbus_message_iter_recurse(&it, &arr); dbus_message_iter_get_arg_type(&arr) == DBUS_TYPE_STRING;
                  dbus_message_iter_next(&arr)) {
                 const char* cap = nullptr;
                 dbus_message_iter_get_basic(&arr, &cap);
                 if (cap && std::strcmp(cap, "body-markup") == 0) markup_ = true;
+                if (cap && std::strcmp(cap, "actions") == 0) actions_ = true;
             }
         });
     }
@@ -520,7 +570,8 @@ private:
         return cache;
     }
 
-    const char* tooltip() const {
+    std::string tooltip() const {
+        if (state_.paused && state_.resume_at) return "Paused until " + local_hhmm(state_.resume_at) + " - click to resume";
         return state_.paused    ? "Paused - click to resume"
                : state_.dry_run ? "Dry run - logging only, blocking nothing"
                                 : "Protecting your keyboard focus";
@@ -777,7 +828,21 @@ private:
     // ---- signals from the bus
 
     DBusHandlerResult on_signal(DBusMessage* m) {
-        if (dbus_message_is_signal(m, DBUS_INTERFACE_DBUS, "NameOwnerChanged")) {
+        if (dbus_message_is_signal(m, "org.freedesktop.Notifications", "ActionInvoked")) {
+            dbus_uint32_t id = 0;
+            const char* key = nullptr;
+            if (dbus_message_get_args(m, nullptr, DBUS_TYPE_UINT32, &id, DBUS_TYPE_STRING, &key, DBUS_TYPE_INVALID)) {
+                auto it = notifications_.find(id);
+                if (it != notifications_.end()) {
+                    pending_calls_.push_back([fn = it->second, k = std::string(key)] { fn(k); });
+                    notifications_.erase(it);
+                }
+            }
+        } else if (dbus_message_is_signal(m, "org.freedesktop.Notifications", "NotificationClosed")) {
+            dbus_uint32_t id = 0, reason = 0;
+            if (dbus_message_get_args(m, nullptr, DBUS_TYPE_UINT32, &id, DBUS_TYPE_UINT32, &reason, DBUS_TYPE_INVALID))
+                notifications_.erase(id);
+        } else if (dbus_message_is_signal(m, DBUS_INTERFACE_DBUS, "NameOwnerChanged")) {
             const char *name = nullptr, *old_owner = nullptr, *new_owner = nullptr;
             if (dbus_message_get_args(m, nullptr, DBUS_TYPE_STRING, &name, DBUS_TYPE_STRING, &old_owner,
                                       DBUS_TYPE_STRING, &new_owner, DBUS_TYPE_INVALID) &&
@@ -796,10 +861,12 @@ private:
     DBusConnection* conn_ = nullptr;
     Handler handler_;
     std::vector<TrayAction> pending_;  // menu clicks, run by pump() after dispatch
+    std::vector<std::function<void()>> pending_calls_;  // notification clicks, likewise
+    std::map<uint32_t, NotifyAction> notifications_;    // shown notifications with buttons, by id
     std::string name_;                 // our org.kde.StatusNotifierItem-PID-1 bus name
     bool tray_on_ = false;
     Host host_ = Host::Absent;
-    bool caps_known_ = false, markup_ = false;
+    bool caps_known_ = false, markup_ = false, actions_ = false;
     TrayState state_;
     bool have_state_ = false;
     uint32_t revision_ = 1;

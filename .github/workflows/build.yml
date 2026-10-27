@@ -1,9 +1,10 @@
 name: Build and release
 
 # Every push and pull request builds both apps and keeps the packages as
-# workflow artifacts. Pushing a tag like v1.0.0 (matching the version in
+# workflow artifacts: a .tar.gz and a .deb for Linux, a zip and an installer
+# for Windows. Pushing a tag like v1.0.1 (matching the version in
 # CMakeLists.txt) also publishes them as a GitHub release; a tag with a
-# suffix such as v1.0.0-rc.1 becomes a pre-release.
+# suffix such as v1.0.1-rc.1 becomes a pre-release.
 
 on:
   push:
@@ -62,11 +63,12 @@ jobs:
           cmake --build build --parallel
       - name: Unit tests
         run: ctest --test-dir build --output-on-failure
-      - name: Build the settings app
+      - name: Build the settings app (and both programs for the .deb)
         # Uses the system's Qt (and so its libstdc++); built against Qt 6.2, it runs with any newer Qt 6.
         run: |
-          cmake -B build-gui -DCMAKE_BUILD_TYPE=Release -DFOCUSGUARD_GUI=ON -DFOCUSGUARD_TESTS=OFF
-          cmake --build build-gui --parallel --target focusguard-settings
+          cmake -B build-gui -DCMAKE_BUILD_TYPE=Release -DFOCUSGUARD_GUI=ON -DFOCUSGUARD_TESTS=OFF \
+                -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build build-gui --parallel
       - name: Smoke test
         run: |
           ./build/focusguard --version
@@ -83,10 +85,25 @@ jobs:
              CHANGELOG.md focusguard.conf.example data/focusguard-settings.desktop data/focusguard.svg "$dir/"
           strip "$dir/focusguard" "$dir/focusguard-settings"
           tar czf "$dir.tar.gz" "$dir"
+          # The .deb takes its dependencies from the binaries (dpkg-shlibdeps).
+          (cd build-gui && cpack -G DEB)
+          mv build-gui/focusguard_*.deb .
+          dpkg-deb --info focusguard_*.deb
+      - name: Test the .deb
+        run: |
+          sudo apt-get install -y ./focusguard_*.deb
+          /usr/bin/focusguard --version
+          status=0
+          QT_QPA_PLATFORM=offscreen timeout 5 /usr/bin/focusguard-settings || status=$?
+          [ "$status" -eq 124 ] || { echo "::error::installed focusguard-settings exited early ($status)"; exit 1; }
+          sudo apt-get remove -y focusguard
+          [ ! -e /usr/bin/focusguard ] || { echo "::error::not removed"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64
-          path: focusguard-*.tar.gz
+          path: |
+            focusguard-*.tar.gz
+            focusguard_*.deb
           if-no-files-found: error
 
   windows:
@@ -134,10 +151,42 @@ jobs:
           if (-not $crt) { Write-Error "MSVC runtime DLLs not found"; exit 1 }
           Copy-Item "$($crt.FullName)\*.dll" "$dir/"
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+      - name: Installer
+        run: |
+          $dir = "focusguard-${{ needs.version.outputs.version }}-windows-x64"
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          & $iscc /Qp "/DAppVersion=${{ needs.version.outputs.version }}" "/DPackageDir=$pwd\$dir" "/DOutputDir=$pwd" `
+                  installer\focusguard.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test the installer
+        # Silent install with the default choices, then uninstall; both must leave things as promised.
+        run: |
+          $setup = (Get-Item focusguard-*-setup.exe).FullName
+          $app = "$env:LOCALAPPDATA\Programs\FocusGuard"
+          $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+          $p = Start-Process $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=install.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content install.log; Write-Error "setup failed ($($p.ExitCode))" }
+          foreach ($f in "focusguard.exe", "focusguard-tray.exe", "focusguard-settings.exe", "Qt6Core.dll", "unins000.exe") {
+            if (-not (Test-Path "$app\$f")) { Write-Error "not installed: $f" }
+          }
+          $autostart = (Get-ItemProperty $runKey).FocusGuard
+          if ($autostart -ne "`"$app\focusguard-tray.exe`"") { Write-Error "unexpected autostart entry: $autostart" }
+          & "$app\focusguard.exe" --version
+          Start-Process "$app\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait
+          # The uninstaller hands over to a copy of itself, so wait for the folder to go.
+          for ($i = 0; $i -lt 60 -and (Test-Path $app); $i++) { Start-Sleep 1 }
+          if (Test-Path $app) { Get-ChildItem -Recurse $app; Write-Error "not uninstalled" }
+          if ((Get-ItemProperty $runKey).FocusGuard) { Write-Error "autostart entry left behind" }
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64
-          path: focusguard-*.zip
+          path: |
+            focusguard-*.zip
+            focusguard-*-setup.exe
           if-no-files-found: error
 
   release:

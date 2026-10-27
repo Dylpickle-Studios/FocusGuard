@@ -5,6 +5,7 @@
 #include <QClipboard>
 #include <QComboBox>
 #include <QDateTime>
+#include <QDesktopServices>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFileDialog>
@@ -29,6 +30,7 @@
 #include "daemon_client.h"
 #include "platform.h"
 #include "settings_model.h"
+#include "update_check.h"
 #include "widgets.h"
 
 namespace {
@@ -95,6 +97,40 @@ QString appEntry(const QJsonObject& o) {
     return e;
 }
 
+// "0.4 s", "12 s": a delay as people read it.
+QString seconds(double ms) {
+    if (ms < 10000) return QObject::tr("%1 s").arg(QLocale().toString(ms / 1000.0, 'f', 1));
+    return QObject::tr("%1 s").arg(qRound(ms / 1000.0));
+}
+
+// How close a decision came to the grace period, for tuning it. Returns the
+// cell text, sets `hint` to an explanation and `near` when it was close.
+QString timing(const QJsonObject& e, uint32_t grace, QString& hint, bool& near) {
+    const double after = e.value("after").toDouble(-1);
+    near = false;
+    hint.clear();
+    if (after < 0) return QStringLiteral("–");
+    if (after >= 60000) return QObject::tr("over a minute");
+    const QString kind = e.value("kind").toString(), reason = e.value("reason").toString();
+    const QString a = seconds(after), g = seconds(grace);
+    if (kind == "allowed" && reason == "user action") {
+        near = after >= grace / 2.0;
+        hint = QObject::tr("This came %1 after your last click, Alt+Tab, Enter or similar: within your grace "
+                           "period of %2, so FocusGuard took it as your doing. If you didn't ask for this window, "
+                           "a grace period shorter than %1 would have blocked it.")
+                   .arg(a, g);
+    } else if ((kind == "blocked" || kind == "would-block") && reason == "no user action" && after <= grace + 3000.0) {
+        near = true;
+        hint = QObject::tr("This came %1 after your last click, Alt+Tab, Enter or similar: just after your grace "
+                           "period of %2. If it was a window you were waiting for, a grace period longer than %1 "
+                           "would have let it through.")
+                   .arg(a, g);
+    } else {
+        hint = QObject::tr("%1 after your last click, Alt+Tab, Enter or similar. Your grace period is %2.").arg(a, g);
+    }
+    return a;
+}
+
 // A path for display: the home directory shortened to ~ (Linux).
 QString displayPath(const QString& path) {
 #ifndef Q_OS_WIN
@@ -116,8 +152,40 @@ QString toggleName(const QString& key) {
 
 // ------------------------------------------------------------------ Status
 
-StatusPage::StatusPage(DaemonClient* client, QWidget* parent) : QWidget(parent), client_(client) {
+StatusPage::StatusPage(DaemonClient* client, QWidget* parent)
+    : QWidget(parent), client_(client), updates_(new UpdateCheck(this)) {
     auto* v = pageLayout(this, tr("Status"), {});
+
+    // First run: offer to start FocusGuard now and at every login.
+    welcome_ = new ui::Card(tr("Welcome to FocusGuard"),
+                            tr("FocusGuard works quietly in the background: it stops other windows from taking "
+                               "your keyboard focus while you type or click. It needs to be running to do that."));
+    auto* wb = new QHBoxLayout;
+    wb->setSpacing(8);
+    welcomeStart_ = ui::button({}, true);
+    auto* welcomeLater = ui::button(tr("Not now"));
+    wb->addWidget(welcomeStart_);
+    wb->addWidget(welcomeLater);
+    wb->addStretch();
+    welcome_->body()->addLayout(wb);
+    v->addWidget(welcome_);
+    // Seen it before, or already set to start at login (by the installer, say).
+    const bool welcomed = platform::preferences().value("welcomed", false).toBool() || platform::autostartEnabled();
+    welcome_->setVisible(!welcomed);
+    if (welcomed) platform::preferences().setValue("welcomed", true);
+
+    // A newer release, when the update check is on and found one.
+    updateBanner_ = new QFrame;
+    updateBanner_->setObjectName("banner");
+    updateBanner_->setAttribute(Qt::WA_StyledBackground);
+    auto* ub = new QHBoxLayout(updateBanner_);
+    ub->setContentsMargins(0, 0, 0, 0);
+    updateText_ = new QLabel;
+    updateText_->setWordWrap(true);
+    ub->addWidget(updateText_, 1);
+    auto* download = ui::button(tr("Download"));
+    ub->addWidget(download, 0, Qt::AlignVCenter);
+    v->addWidget(updateBanner_);
 
     // Hero: shield, state and the main actions.
     auto* hero = new ui::Card;
@@ -135,6 +203,10 @@ StatusPage::StatusPage(DaemonClient* client, QWidget* parent) : QWidget(parent),
     auto* buttons = new QHBoxLayout;
     buttons->setSpacing(8);
     pause_ = ui::button({}, true);
+    pauseMenu_ = new QMenu(pause_);
+    pauseMenu_->addAction(tr("Until I resume"), this, [this] { client_->send("pause"); });
+    pauseMenu_->addAction(tr("For 15 minutes"), this, [this] { client_->send("pause 15"); });
+    pauseMenu_->addAction(tr("For 1 hour"), this, [this] { client_->send("pause 60"); });
     startStop_ = ui::button({});
     buttons->addWidget(pause_);
     buttons->addWidget(startStop_);
@@ -183,13 +255,20 @@ StatusPage::StatusPage(DaemonClient* client, QWidget* parent) : QWidget(parent),
     stats->body()->addWidget(noBlocks_);
     v->addWidget(stats);
 
-    // Startup.
-    auto* startup = new ui::Card(tr("Startup"));
+    // Startup and updates.
+    auto* startup = new ui::Card(tr("Startup and updates"));
     autostart_ = new ui::Switch;
     autostart_->setChecked(platform::autostartEnabled());
     startup->body()->addWidget(ui::settingRow(tr("Start FocusGuard when you log in"),
                                           tr("Runs it in the background, with its tray icon, every time you sign in."),
                                           autostart_));
+    checkUpdates_ = new ui::Switch;
+    checkUpdates_->setChecked(updates_->enabled());
+    startup->body()->addWidget(ui::settingRow(
+        tr("Check for new versions"),
+        tr("Once a day, this app asks GitHub whether a newer FocusGuard exists. GitHub sees your IP address; "
+           "nothing else is sent."),
+        checkUpdates_));
     v->addWidget(startup);
 
     details_ = ui::hintLabel({});
@@ -197,24 +276,24 @@ StatusPage::StatusPage(DaemonClient* client, QWidget* parent) : QWidget(parent),
     v->addWidget(details_);
     v->addStretch();
 
+    // While running, the button opens the pause menu; while paused, it resumes.
     connect(pause_, &QPushButton::clicked, this, [this] {
-        client_->send(client_->status().value("paused").toBool() ? "resume" : "pause");
+        if (client_->status().value("paused").toBool()) client_->send("resume");
     });
     connect(startStop_, &QPushButton::clicked, this, [this] {
-        if (client_->isConnected()) {
-            client_->send("quit");
-            return;
-        }
-        QString err;
-        if (!platform::startDaemon(&err)) {
-            QMessageBox::warning(this, tr("FocusGuard"), err);
-            return;
-        }
-        startStop_->setEnabled(false);
-        startStop_->setText(tr("Starting…"));
-        client_->reconnectSoon(400);
-        QTimer::singleShot(4000, this, [this] { refresh(); });  // give up waiting visibly
+        if (client_->isConnected()) client_->send("quit");
+        else startDaemon();
     });
+    connect(welcomeStart_, &QPushButton::clicked, this, [this] {
+        autostart_->setChecked(true);           // its handler enables starting at login
+        if (!autostart_->isChecked()) return;  // it couldn't, and said why
+        if (!client_->isConnected()) startDaemon();
+        finishWelcome();
+    });
+    connect(welcomeLater, &QPushButton::clicked, this, &StatusPage::finishWelcome);
+    connect(checkUpdates_, &QAbstractButton::toggled, updates_, &UpdateCheck::setEnabled);
+    connect(updates_, &UpdateCheck::changed, this, &StatusPage::refresh);
+    connect(download, &QPushButton::clicked, this, [this] { QDesktopServices::openUrl(QUrl(updates_->releasePage())); });
     connect(reset_, &QPushButton::clicked, this, [this] {
         if (QMessageBox::question(this, tr("Reset statistics"), tr("Start the statistics over? This can't be undone.")) ==
             QMessageBox::Yes)
@@ -231,6 +310,24 @@ StatusPage::StatusPage(DaemonClient* client, QWidget* parent) : QWidget(parent),
     connect(client_, &DaemonClient::statusChanged, this, &StatusPage::refresh);
     connect(client_, &DaemonClient::connectionChanged, this, &StatusPage::refresh);
     refresh();
+    updates_->checkIfDue();
+}
+
+void StatusPage::startDaemon() {
+    QString err;
+    if (!platform::startDaemon(&err)) {
+        QMessageBox::warning(this, tr("FocusGuard"), err);
+        return;
+    }
+    startStop_->setEnabled(false);
+    startStop_->setText(tr("Starting…"));
+    client_->reconnectSoon(400);
+    QTimer::singleShot(4000, this, [this] { refresh(); });  // give up waiting visibly
+}
+
+void StatusPage::finishWelcome() {
+    platform::preferences().setValue("welcomed", true);
+    welcome_->hide();
 }
 
 void StatusPage::refresh() {
@@ -248,19 +345,29 @@ void StatusPage::refresh() {
     } else {
         shield_->setState(paused ? ui::ShieldState::Paused : dry ? ui::ShieldState::DryRun : ui::ShieldState::Active);
         title_->setText(paused ? tr("Paused") : dry ? tr("Dry run") : tr("Protecting your focus"));
-        subtitle_->setText(paused ? tr("Any window may take focus until you resume.")
+        const qint64 until = (qint64)s.value("paused_until").toDouble();
+        const QString untilText =
+            QLocale().toString(QDateTime::fromMSecsSinceEpoch(until).time(), QLocale::ShortFormat);
+        subtitle_->setText(paused && until ? tr("Any window may take focus until %1, when protection resumes by itself.")
+                                                 .arg(untilText)
+                           : paused ? tr("Any window may take focus until you resume.")
                            : dry  ? tr("Focus steals are logged on the Activity page but not blocked.")
                            : s.value("strict").toBool()
                                ? tr("Strict mode: only your own actions and the allow list may change focus.")
                                : tr("Windows only get focus when you switch to them."));
         pause_->show();
         pause_->setText(paused ? tr("Resume") : tr("Pause"));
+        pause_->setMenu(paused ? nullptr : pauseMenu_);
         startStop_->setText(tr("Stop FocusGuard"));
         startStop_->setObjectName("secondary");
     }
     startStop_->style()->unpolish(startStop_);  // objectName changed: re-apply the stylesheet
     startStop_->style()->polish(startStop_);
     overrides_->setVisible(running && s.value("cli_overrides").toBool());
+    welcomeStart_->setText(running ? tr("Start it every time I log in") : tr("Start now and every time I log in"));
+    const QString newer = updates_->newerVersion();
+    updateText_->setText(tr("FocusGuard %1 is available. You have %2.").arg(newer, fg::kVersion));
+    updateBanner_->setVisible(!newer.isEmpty());
 
     blocked_->setText(QString::number(s.value("blocked").toInt()));
     // With the history on, the all-time numbers are the interesting ones.
@@ -297,7 +404,8 @@ ActivityPage::ActivityPage(DaemonClient* client, SettingsModel* model, QWidget* 
     v->setSpacing(12);
     v->addWidget(ui::pageTitle(tr("Activity")));
     v->addWidget(ui::hintLabel(tr("Focus changes FocusGuard judged, newest first. Right-click an entry to always "
-                                  "allow or block that app.")));
+                                  "allow or block that app. Times in orange came close to your grace period; "
+                                  "hover over them for a tuning hint.")));
 
     auto* bar = new QHBoxLayout;
     showAllowed_ = new ui::Switch;
@@ -313,7 +421,8 @@ ActivityPage::ActivityPage(DaemonClient* client, SettingsModel* model, QWidget* 
     card->body()->setContentsMargins(1, 1, 1, 1);
     tree_ = new QTreeWidget;
     tree_->setObjectName("table");
-    tree_->setHeaderLabels({tr("Time"), tr("Result"), tr("App"), tr("Window"), tr("Reason")});
+    tree_->setHeaderLabels({tr("Time"), tr("Result"), tr("App"), tr("Window"), tr("Reason"), tr("After you")});
+    tree_->headerItem()->setToolTip(5, tr("How long after your last click, Alt+Tab, Enter or similar it happened"));
     tree_->setRootIsDecorated(false);
     tree_->setUniformRowHeights(true);
     tree_->setAlternatingRowColors(false);
@@ -322,10 +431,11 @@ ActivityPage::ActivityPage(DaemonClient* client, SettingsModel* model, QWidget* 
     tree_->setSelectionMode(QAbstractItemView::SingleSelection);
     tree_->header()->setStretchLastSection(false);
     tree_->header()->setSectionResizeMode(3, QHeaderView::Stretch);
-    tree_->setColumnWidth(0, 104);
-    tree_->setColumnWidth(1, 110);
-    tree_->setColumnWidth(2, 140);
-    tree_->setColumnWidth(4, 200);
+    tree_->setColumnWidth(0, 96);
+    tree_->setColumnWidth(1, 108);
+    tree_->setColumnWidth(2, 120);
+    tree_->setColumnWidth(4, 150);
+    tree_->setColumnWidth(5, 100);
     card->body()->addWidget(tree_);
     empty_ = ui::hintLabel({});
     empty_->setAlignment(Qt::AlignCenter);
@@ -360,6 +470,15 @@ ActivityPage::ActivityPage(DaemonClient* client, SettingsModel* model, QWidget* 
         while (tree_->topLevelItemCount() > 2000) delete tree_->takeTopLevelItem(tree_->topLevelItemCount() - 1);
     });
     connect(client_, &DaemonClient::connectionChanged, this, &ActivityPage::rebuild);
+    // The hints compare with the grace period in the settings file.
+    grace_ = model_->config.grace_ms;
+    auto graceChanged = [this] {  // once saved: unsaved edits aren't in effect yet
+        if (model_->dirty() || model_->config.grace_ms == grace_) return;
+        grace_ = model_->config.grace_ms;
+        rebuild();
+    };
+    connect(model_, &SettingsModel::refreshNeeded, this, graceChanged);
+    connect(model_, &SettingsModel::dirtyChanged, this, graceChanged);
     rebuild();
 }
 
@@ -372,10 +491,16 @@ void ActivityPage::add(const QJsonObject& e, bool atTop) {
     const QString time = when.date() == QDate::currentDate()
                              ? when.toString("HH:mm:ss")
                              : QLocale().toString(when.date(), "d MMM") + " " + when.toString("HH:mm");
+    QString hint;
+    bool near = false;
+    const QString after = timing(e, grace_, hint, near);
     auto* item = new QTreeWidgetItem({time, QStringLiteral("●  ") + kindLabel(kind),
                                       e.value("app").toString(), e.value("title").toString(),
-                                      e.value("reason").toString()});
+                                      e.value("reason").toString(), after});
     item->setForeground(1, kindColor(kind, t));
+    if (near) item->setForeground(5, t.warn);
+    item->setToolTip(5, hint);
+    item->setToolTip(4, hint);
     item->setToolTip(3, e.value("title").toString());
     item->setToolTip(0, when.toString(Qt::TextDate));
     item->setData(0, Qt::UserRole, e);
@@ -451,7 +576,7 @@ SettingsPage::SettingsPage(DaemonClient* client, SettingsModel* model, QWidget* 
     timing->body()->addWidget(ui::settingRow(tr("Grace period"), tr("How long after such an action focus may change."), grace_));
     launchGrace_ = msSpin(fg::kMaxMs, 1000);
     timing->body()->addWidget(ui::settingRow(tr("Startup time for apps you launch"),
-                                             tr("An app you just started may take focus this long while it loads. 0 turns this off."),
+                                             tr("An app you just started may take focus this long while it loads, unless you switch to another window first. 0 turns this off."),
                                              launchGrace_));
     v->addWidget(timing);
 

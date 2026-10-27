@@ -62,6 +62,7 @@ int g_mods_held = 0;
 Window g_current = 0;   // last active window we accepted
 Window g_expected = 0;  // window we asked the WM to re-activate
 bool g_paused = false;
+long long g_resume_at = 0;  // a timed pause ends then (ms since the epoch); 0: none
 int g_sigpipe[2] = {-1, -1};
 bool g_xerror = false;
 #ifdef FOCUSGUARD_TRAY
@@ -249,17 +250,30 @@ std::string default_config_path();  // defined below
 
 // ------------------------------------------------------------------ notify
 
-// Fire-and-forget desktop notification: over D-Bus when connected, otherwise
-// via notify-send (part of libnotify's tools). Children are auto-reaped
-// (SA_NOCLDWAIT) so no zombies accumulate.
-void notify(const std::string& app, const std::string& title) {
+void show_window(Window w);                // defined below
+void allow_app(const std::string& entry);  // defined below
+
+// Desktop notification about a blocked window: over D-Bus when connected,
+// with "Show it" and "Always allow" buttons; otherwise via notify-send (part
+// of libnotify's tools). Children are auto-reaped (SA_NOCLDWAIT) so no zombies
+// accumulate.
+void notify(const std::string& app, const std::string& title, Window w, const std::string& entry) {
     const std::string body = app + (title.empty() ? "" : ": " + fg::ellipsize(title, 80)) +
                              "\ntried to steal focus";
 #ifdef FOCUSGUARD_TRAY
     if (g_bus.connected()) {
-        g_bus.notify("FocusGuard blocked a window", body, "dialog-warning");
+        std::vector<fg::DesktopBus::NotifyButton> buttons = {{"show", "Show it"}};
+        if (!entry.empty()) buttons.push_back({"allow", "Always allow"});
+        g_bus.notify("FocusGuard blocked a window", body, "dialog-warning", buttons,
+                     [w, entry](const std::string& key) {
+                         if (key == "allow") allow_app(entry);
+                         else show_window(w);  // "show", or the notification itself
+                     });
         return;
     }
+#else
+    (void)w;
+    (void)entry;
 #endif
     const pid_t pid = fork();
     if (pid != 0) return;  // parent (or fork failure): carry on
@@ -307,7 +321,7 @@ void reload() {
 
 std::string status_json() {
     const std::string path = g_cfg.config_path.empty() ? default_config_path() : g_cfg.config_path;
-    return fg::status_json({g_cfg, g_paused, g_stats, g_all_time, g_since, getpid(), path,
+    return fg::status_json({g_cfg, g_paused, g_resume_at, g_stats, g_all_time, g_since, getpid(), path,
                             fg::has_cli_overrides(g_args), g_overrides.list()});
 }
 
@@ -351,8 +365,8 @@ void push_status() {
 }
 
 void record_event(const char* kind, const std::string& app, const std::string& process, const std::string& cls,
-                  const std::string& title, const char* reason) {
-    fg::Event e{fg::wall_ms(), kind, app, process, cls, title, reason};
+                  const std::string& title, const char* reason, long long after_ms) {
+    fg::Event e{fg::wall_ms(), kind, app, process, cls, title, reason, after_ms};
     if (g_ctl.has_subscribers()) g_ctl.broadcast(fg::event_json(e, "event"));
     g_history.append(e);
     g_events.add(std::move(e));
@@ -436,12 +450,14 @@ void on_active_changed(Time when) {
     const std::string app = !cls.empty() ? cls : !proc.comm.empty() ? proc.comm : inst.empty() ? "?" : inst;
     auto who = [&] { return app + " \"" + fg::ellipsize(title, 60) + "\""; };
 
+    const long long after = g_intent.since_last(t);
     auto record = [&](const char* kind, const char* reason) {
-        record_event(kind, app, proc.comm, cls, title, reason);
+        record_event(kind, app, proc.comm, cls, title, reason, after);
     };
 
     const fg::Decision d = fg::decide(f);
     if (d.allow) {
+        if (f.user_intent) g_intent.switched(t);  // apps launched before this lose their launch pass
         if (fg::log_state().level >= 2) fg::logmsg(2, "allowed  %s  (%s)", who().c_str(), d.reason);
         record("allowed", d.reason);
         return;
@@ -473,7 +489,7 @@ void on_active_changed(Time when) {
     fg::logmsg(1, "blocked  %s  (%s)", who().c_str(), d.reason);
     record("blocked", d.reason);
     push_status();  // the statistics changed
-    if (g_cfg.notify && g_notify_gate.allow(t, g_cfg)) notify(app, title);
+    if (g_cfg.notify && g_notify_gate.allow(t, g_cfg)) notify(app, title, w, !cls.empty() ? cls : proc.comm);
 }
 
 void build_keymap() {
@@ -642,14 +658,45 @@ void quit_soon() {
     (void)n;
 }
 
-void toggle_pause() {
-    g_paused = !g_paused;
-    if (!g_paused) {
-        g_current = active_window();
-        g_expected = 0;
+// Pause for `minutes`, or (0) until resumed; or resume.
+void set_paused(bool on, uint32_t minutes = 0) {
+    g_resume_at = on && minutes ? fg::wall_ms() + minutes * 60000LL : 0;
+    if (on != g_paused) {
+        g_paused = on;
+        if (!on) {
+            g_current = active_window();
+            g_expected = 0;
+        }
     }
-    fg::logmsg(1, "%s", g_paused ? "paused" : "resumed");
+    if (!on) fg::logmsg(1, "resumed");
+    else if (minutes) fg::logmsg(1, "paused until %s", fg::local_hhmm(g_resume_at).c_str());
+    else fg::logmsg(1, "paused");
     sync_bus(false);
+}
+
+void toggle_pause() { set_paused(!g_paused); }
+
+// Bring the window the user asked for (from a notification) to the front.
+void show_window(Window w) {
+    XWindowAttributes a;
+    g_xerror = false;
+    if (!XGetWindowAttributes(g_dpy, w, &a) || g_xerror) return;  // closed meanwhile
+    g_expected = w;  // our own doing: don't judge it
+    send_wm_message(w, A.active, 2, CurrentTime, 0, 0);
+    XFlush(g_dpy);
+}
+
+// "Always allow" from a notification: add the app to the allow list in the
+// settings file, then reload it.
+void allow_app(const std::string& entry) {
+    const std::string path = g_cfg.config_path.empty() ? default_config_path() : g_cfg.config_path;
+    std::string err;
+    if (path.empty() || !fg::add_to_config_file(path, true, entry, err)) {
+        fg::logmsg(0, "couldn't add '%s' to the allow list: %s", entry.c_str(), err.c_str());
+        return;
+    }
+    fg::logmsg(1, "'%s' added to the allow list in %s", entry.c_str(), path.c_str());
+    reload();
 }
 
 // ------------------------------------------------------------------ tray
@@ -719,6 +766,12 @@ void on_tray_action(fg::TrayAction a) {
         case fg::TrayAction::TogglePause:
             toggle_pause();
             return;  // already synced
+        case fg::TrayAction::Pause15:
+            set_paused(true, 15);
+            return;
+        case fg::TrayAction::Pause60:
+            set_paused(true, 60);
+            return;
         case fg::TrayAction::ToggleStrict: flip(fg::Toggle::Strict, "strict mode"); break;
         case fg::TrayAction::ToggleMinimize: flip(fg::Toggle::Minimize, "minimise-on-block"); break;
         case fg::TrayAction::ToggleNotify: flip(fg::Toggle::Notify, "notifications"); break;
@@ -776,6 +829,7 @@ void sync_bus(bool may_connect) {
         st.minimize = g_cfg.minimize_on_block;
         st.notify = g_cfg.notify;
         st.dry_run = g_cfg.dry_run;
+        st.resume_at = g_paused ? g_resume_at : 0;
         g_bus.set_state(st);
         g_bus.set_tray(g_cfg.tray);
     }
@@ -881,9 +935,7 @@ int main(int argc, char** argv) {
     const fg::ControlHooks control_hooks{
         status_json,
         [] { return fg::windows_json(list_windows()); },
-        [](bool pause) {
-            if (pause != g_paused) toggle_pause();
-        },
+        [](bool pause, uint32_t minutes) { set_paused(pause, minutes); },
         reload,
         quit_soon,
         clear_history,
@@ -919,7 +971,19 @@ int main(int argc, char** argv) {
 #endif
         std::vector<pollfd> fds = {{xfd, POLLIN, 0}, {g_sigpipe[0], POLLIN, 0}, {bus_fd, POLLIN, 0}};
         g_ctl.fill(fds);
-        if (poll(fds.data(), fds.size(), -1) < 0) {
+        // A timed pause wakes us when it ends. The wall clock is checked on
+        // every turn, so time spent suspended counts too.
+        int timeout = -1;
+        if (g_paused && g_resume_at) {
+            const long long left = g_resume_at - fg::wall_ms();
+            timeout = left <= 0 ? 0 : (int)std::min(left, 60000LL);
+        }
+        const int ready = poll(fds.data(), fds.size(), timeout);
+        if (g_paused && g_resume_at && fg::wall_ms() >= g_resume_at) {
+            fg::logmsg(1, "pause over");
+            set_paused(false);
+        }
+        if (ready < 0) {
             if (errno == EINTR) continue;
             break;
         }

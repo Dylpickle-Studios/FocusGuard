@@ -8,7 +8,7 @@
 //   status     -> {"type":"status", "paused":..., "blocked":..., "top":[...], ...}
 //   events     -> {"type":"events", "items":[event, ...]}   recent decisions
 //   windows    -> {"type":"windows", "items":[window, ...]} open windows, for the picker
-//   pause | resume | reload | quit | subscribe -> {"type":"ok"}
+//   pause [MINUTES] | resume | reload | quit | subscribe -> {"type":"ok"}
 //   clear-history | reset-stats                 -> {"type":"ok"}
 //
 // After "subscribe" the daemon also pushes {"type":"event", ...} for every
@@ -133,6 +133,7 @@ struct Event {
     long long time_ms = 0;  // wall clock, ms since the Unix epoch
     std::string kind;       // blocked, allowed, would-block, gave-up, failed
     std::string app, process, cls, title, reason;
+    long long after_ms = -1;  // how long after your last deliberate action (-1: none remembered)
 };
 
 inline long long wall_ms() {
@@ -143,14 +144,15 @@ inline long long wall_ms() {
 inline std::string event_json(const Event& e, const char* type = nullptr) {
     JsonObj o;
     if (type) o.str("type", type);
-    return o.num("time", e.time_ms)
+    o.num("time", e.time_ms)
         .str("kind", e.kind)
         .str("app", e.app)
         .str("process", e.process)
         .str("class", e.cls)
         .str("title", e.title)
-        .str("reason", e.reason)
-        .done();
+        .str("reason", e.reason);
+    if (e.after_ms >= 0) o.num("after", e.after_ms);
+    return o.done();
 }
 
 // Reads back one line written by event_json(): a flat object of string and
@@ -209,7 +211,9 @@ inline bool parse_event_json(const std::string& line, Event& e) {
         } else {
             const size_t start = i;
             while (i < line.size() && line[i] != ',' && line[i] != '}') ++i;
-            if (key == "time") e.time_ms = std::strtoll(line.substr(start, i - start).c_str(), nullptr, 10);
+            const long long n = std::strtoll(line.substr(start, i - start).c_str(), nullptr, 10);
+            if (key == "time") e.time_ms = n;
+            else if (key == "after") e.after_ms = n;
         }
         ws();
         if (i < line.size() && line[i] == ',') {
@@ -386,6 +390,7 @@ inline std::string windows_json(const std::vector<WindowInfo>& ws) {
 struct StatusInfo {
     const Config& config;
     bool paused;
+    long long paused_until;  // when a timed pause ends, ms since the epoch; 0: until resumed
     const Stats& session;   // since the daemon started
     const Stats& all_time;  // persisted (equals `session` without history)
     long long since;        // start of the all-time statistics, ms since the epoch
@@ -419,6 +424,7 @@ inline std::string status_json(const StatusInfo& s) {
         .str("platform", platform)
         .num("pid", s.pid)
         .boolean("paused", s.paused)
+        .num("paused_until", s.paused ? s.paused_until : 0)
         .boolean("dry_run", c.dry_run)
         .boolean("strict", !(c.allow_same_app && c.allow_launched && c.allow_related))
         .boolean("notify", c.notify)
@@ -442,12 +448,14 @@ inline std::string status_json(const StatusInfo& s) {
 struct ControlHooks {
     std::function<std::string()> status;   // status_json(...)
     std::function<std::string()> windows;  // windows_json(...)
-    std::function<void(bool)> set_paused;
+    std::function<void(bool, uint32_t)> set_paused;  // (pause?, minutes; 0 = until resumed)
     std::function<void()> reload;
     std::function<void()> quit;
     std::function<void()> clear_history;
     std::function<void()> reset_stats;
 };
+
+constexpr uint32_t kMaxPauseMinutes = 24 * 60;
 
 // Answers one command line. Returns the reply (newline-terminated); sets
 // `subscribe` when the client asks for pushed updates.
@@ -459,7 +467,14 @@ inline std::string handle_control(const std::string& line, const EventLog& log, 
     if (cmd == "status") reply = h.status();
     else if (cmd == "events") reply = log.json();
     else if (cmd == "windows") reply = h.windows();
-    else if (cmd == "pause" || cmd == "resume") h.set_paused(cmd == "pause"), reply = ok;
+    else if (cmd == "pause" || cmd == "resume") h.set_paused(cmd == "pause", 0), reply = ok;
+    else if (cmd.rfind("pause ", 0) == 0) {
+        uint32_t minutes = 0;
+        if (parse_uint(trim(cmd.substr(6)), minutes) && minutes > 0 && minutes <= kMaxPauseMinutes)
+            h.set_paused(true, minutes), reply = ok;
+        else
+            reply = JsonObj().str("type", "error").str("message", "pause takes a number of minutes (1 to 1440)").done();
+    }
     else if (cmd == "reload") h.reload(), reply = ok;
     else if (cmd == "quit") h.quit(), reply = ok;
     else if (cmd == "clear-history") h.clear_history(), reply = ok;

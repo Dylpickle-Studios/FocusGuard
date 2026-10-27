@@ -7,6 +7,7 @@
 #include <QFileInfo>
 #include <QProcess>
 #include <QSaveFile>
+#include <QSettings>
 #include <QStandardPaths>
 
 #ifdef Q_OS_WIN
@@ -17,13 +18,16 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-
-#include <QSettings>
 #endif
 
 #include "control.hpp"
 
 namespace platform {
+
+QSettings& preferences() {
+    static QSettings prefs(QSettings::NativeFormat, QSettings::UserScope, "FocusGuard", "FocusGuard Settings");
+    return prefs;
+}
 
 QString controlEndpoint() {
 #ifdef Q_OS_WIN

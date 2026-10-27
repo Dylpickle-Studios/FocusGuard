@@ -234,6 +234,32 @@ TEST(launched) {
     CHECK(!fg::launched_by_user(t, true, 1000, 12000, c));
 }
 
+TEST(launched_until_you_move_on) {
+    fg::Config c;
+    // Enter in a launcher at 10 s starts Discord at 10.1 s; the launcher closing
+    // hands focus back (a switch, but caused by that same Enter): still a launch.
+    fg::IntentTracker t;
+    t.mark(10000);
+    t.switched(10150);
+    CHECK(fg::launched_by_user(t, true, 3900, 14000, c));
+    // You click back into the terminal at 12 s; Discord's main window shows up at
+    // 16 s and no longer counts as just launched.
+    t.mark(12000);
+    t.switched(12050);
+    CHECK(!fg::launched_by_user(t, true, 5900, 16000, c));
+    // A click that didn't switch windows (typing in the terminal) changes nothing.
+    fg::IntentTracker u;
+    u.mark(10000);
+    u.mark(12000);
+    CHECK(fg::launched_by_user(u, true, 5900, 16000, c));
+    // Apps launched after the switch get their pass as usual.
+    t.mark(20000);
+    CHECK(fg::launched_by_user(t, true, 500, 20600, c));
+    // A switch is remembered by its action, so an earlier one can't undo a later one.
+    t.switched(11000);
+    CHECK(!fg::launched_by_user(t, true, 5900, 16000, c));
+}
+
 TEST(decide) {
     fg::Facts f;
     CHECK(!fg::decide(f).allow);
@@ -352,6 +378,65 @@ TEST(event_round_trip) {
     CHECK(!fg::parse_event_json("{\"kind\":\"blocked\"", back));
     CHECK(!fg::parse_event_json("{\"time\":5}", back));  // no kind
     CHECK(!fg::parse_event_json("not json", back));
+    CHECK(back.after_ms == -1 && fg::event_json(e).find("after") == std::string::npos);  // unknown: left out
+    e.after_ms = 1234;
+    CHECK(fg::parse_event_json(fg::event_json(e), back) && back.after_ms == 1234);
+}
+
+TEST(since_last) {
+    fg::IntentTracker t;
+    CHECK(t.since_last(5000) == -1);
+    t.mark(1000);
+    t.mark(3000);
+    CHECK(t.since_last(4200) == 1200);
+    CHECK(t.since_last(2000) == 1000);  // a later action can't explain an earlier change
+    t.mark(0xFFFFFF00u);
+    CHECK(t.since_last(0x00000100u) == 0x200);  // across the 32-bit wrap
+}
+
+TEST(version_newer) {
+    CHECK(fg::version_newer("v1.0.2", "1.0.1"));
+    CHECK(fg::version_newer("1.10.0", "1.9.9"));
+    CHECK(fg::version_newer("2.0.0", "1.99.99"));
+    CHECK(!fg::version_newer("v1.0.1", "1.0.1"));
+    CHECK(!fg::version_newer("1.0.0", "1.0.1"));
+    CHECK(!fg::version_newer("v1.0.1-rc.1", "1.0.1"));
+    CHECK(fg::version_newer("1.1", "1.0.9"));
+    CHECK(!fg::version_newer("garbage", "0.0.1"));
+}
+
+TEST(add_to_config_file) {
+    const auto dir = std::filesystem::temp_directory_path() / ("focusguard-cfg-" + std::to_string(fg::wall_ms()));
+    const std::string path = (dir / "sub" / "focusguard.conf").string();
+    std::string err;
+    // A missing file (and folder) is created.
+    CHECK(fg::add_to_config_file(path, true, "Discord", err));
+    fg::Config c;
+    CHECK(fg::load_config_file(path, c, err) == 0 && c.allow == std::vector<std::string>{"Discord"});
+    // Comments survive; the entry moves off the other list; repeats change nothing.
+    if (FILE* f = std::fopen(path.c_str(), "w")) {
+        std::fputs("# mine\ngrace = 700\nblock = discord, Slack\n", f);
+        std::fclose(f);
+    }
+    CHECK(fg::add_to_config_file(path, true, "Discord", err));
+    CHECK(fg::add_to_config_file(path, true, "discord", err));
+    c = fg::Config{};
+    CHECK(fg::load_config_file(path, c, err) == 0);
+    CHECK(c.grace_ms == 700 && c.block == std::vector<std::string>{"Slack"} && c.allow == std::vector<std::string>{"Discord"});
+    std::string text;
+    if (FILE* f = std::fopen(path.c_str(), "r")) {
+        for (int ch; (ch = std::fgetc(f)) != EOF;) text += (char)ch;
+        std::fclose(f);
+    }
+    CHECK(text.find("# mine") == 0);
+    // A broken file is left alone.
+    if (FILE* f = std::fopen(path.c_str(), "w")) {
+        std::fputs("bogus = 1\n", f);
+        std::fclose(f);
+    }
+    CHECK(!fg::add_to_config_file(path, true, "x", err) && !err.empty());
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
 
 TEST(event_log) {
@@ -425,10 +510,11 @@ TEST(control_commands) {
     fg::EventLog log;
     log.add({7, "blocked", "a", "", "", "", "r"});
     bool paused = false, reloaded = false, quit = false, cleared = false, reset = false;
+    uint32_t minutes = 99;
     const fg::ControlHooks hooks{
         [] { return std::string("{\"type\":\"status\"}"); },
         [] { return fg::windows_json({{"App", "app", "Cls", "inst", "Title", true, false, true}}); },
-        [&](bool p) { paused = p; },
+        [&](bool p, uint32_t m) { paused = p, minutes = m; },
         [&] { reloaded = true; },
         [&] { quit = true; },
         [&] { cleared = true; },
@@ -437,7 +523,14 @@ TEST(control_commands) {
     bool sub = false;
     CHECK_EQ(fg::handle_control("status", log, hooks, sub), "{\"type\":\"status\"}\n");
     CHECK(fg::handle_control(" PAUSE \r", log, hooks, sub).find("\"ok\"") != std::string::npos && paused);
+    CHECK(minutes == 0);
     fg::handle_control("resume", log, hooks, sub);
+    CHECK(!paused);
+    CHECK(fg::handle_control("pause 15", log, hooks, sub).find("\"ok\"") != std::string::npos);
+    CHECK(paused && minutes == 15);
+    paused = false;
+    for (const char* bad : {"pause 0", "pause 1441", "pause x", "pause -5", "pause 15m"})
+        CHECK(fg::handle_control(bad, log, hooks, sub).find("\"error\"") != std::string::npos);
     CHECK(!paused);
     fg::handle_control("reload", log, hooks, sub);
     fg::handle_control("quit", log, hooks, sub);
@@ -460,8 +553,8 @@ TEST(status_json) {
     session.record("Popup");
     all.record("Popup", 5);
     const std::string j =
-        fg::status_json({c, true, session, all, 42, 1234, "/x/focusguard.conf", true, {{"dry-run", true}}});
-    for (const char* part : {"\"paused\":true", "\"dry_run\":true", "\"blocked\":1", "\"blocked_total\":5",
+        fg::status_json({c, true, 1793100000000LL, session, all, 42, 1234, "/x/focusguard.conf", true, {{"dry-run", true}}});
+    for (const char* part : {"\"paused\":true", "\"paused_until\":1793100000000", "\"dry_run\":true", "\"blocked\":1", "\"blocked_total\":5",
                              "\"since\":42", "\"pid\":1234", "\"cli_overrides\":true",
                              "\"overrides\":[{\"key\":\"dry-run\",\"value\":true}]", "\"history\":true"})
         CHECK(j.find(part) != std::string::npos);
